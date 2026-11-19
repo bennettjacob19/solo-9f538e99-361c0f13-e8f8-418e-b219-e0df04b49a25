@@ -2,8 +2,11 @@
 single-version resolution for the svc.test. authoritative zone."""
 
 import ipaddress
+import math
 import re
 import threading
+import time
+from datetime import datetime, timezone
 
 ZONE = "svc.test."
 DEFAULT_TTL = 60
@@ -172,6 +175,132 @@ def flatten_records(records):
     return rows
 
 
+def names_holding_ip(records, ip):
+    """All in-zone names whose A set contains this IPv4."""
+    return sorted(name for name, rec in records.items() if ip in rec["A"])
+
+
+def retirement_problems(records, ip, retired_ips):
+    """Validate a request to retire `ip` against the current version.
+
+    The address must currently be published, and every name pointing at it
+    must keep at least one *not-yet-retired* backup A record. The candidate
+    address itself counts as retired, so a name whose only A is this address
+    has no backup.
+    Returns a list of human-readable problems (empty == acceptable).
+    """
+    problems = []
+    unavailable = set(retired_ips) | {ip}
+    names = names_holding_ip(records, ip)
+    if not names:
+        problems.append(f"{ip}: 当前区域没有任何名称的 A 记录指向该地址，无法发起退役")
+    for name in names:
+        backups = [a for a in records[name]["A"] if a not in unavailable]
+        if not backups:
+            problems.append(
+                f"{name}: 指向 {ip} 的名称没有未退役的备用 A 记录，退役会导致该名称无可用地址"
+            )
+    return problems
+
+
+def publish_retirement_problems(candidate, retirements, now):
+    """Whole-version checks imposed by committed retirements.
+
+    - a deadline already passed: the address may not appear anywhere in
+      the submission (no A record may carry it);
+    - before the deadline: every name that pointed at the address in the
+      version at retirement time must keep that exact name set, and each
+      such name must keep at least one not-retired backup A record.
+    """
+    problems = []
+    for r in retirements:
+        ip, deadline = r.ip, r.deadline
+        unavailable = set(r.other_retired_ips) | {ip}
+        names = names_holding_ip(r.snapshot_records, ip)
+        candidate_names = names_holding_ip(candidate, ip)
+        if deadline <= now:
+            if candidate_names:
+                problems.append(
+                    f"{ip}: 该地址已于 {r.deadline_text()} 到期退役，整版提交中不得再出现该地址"
+                )
+            continue
+        if sorted(candidate_names) != names:
+            problems.append(
+                f"{ip}: 退役到期前，整版发布必须保持该地址对应的名称集合"
+                f"（应为 {', '.join(names)}，实际 {', '.join(candidate_names) or '无'}）"
+            )
+        for name in names:
+            rec = candidate.get(name)
+            backups = [a for a in (rec["A"] if rec else []) if a not in unavailable]
+            if not backups:
+                problems.append(
+                    f"{name}: 退役到期前必须为该名称保留至少一个未退役的备用 A 记录"
+                )
+    return problems
+
+
+class Retirement:
+    """One IPv4 address being decommissioned.
+
+    The deadline is acceptance time + the largest TTL ever published for
+    the address. Until the deadline the address keeps answering, with every
+    A TTL capped to the remaining whole seconds; afterwards it is removed.
+    """
+
+    __slots__ = ("ip", "deadline", "max_ttl", "created_at",
+                 "snapshot_records", "other_retired_ips")
+
+    def __init__(self, ip, deadline, max_ttl, created_at,
+                 snapshot_records=None, other_retired_ips=frozenset()):
+        self.ip = ip
+        self.deadline = float(deadline)
+        self.max_ttl = int(max_ttl)
+        self.created_at = created_at
+        # frozen view of the version accepted at retirement time, so the
+        # "keep the same name set" publish rule survives later versions
+        self.snapshot_records = snapshot_records
+        self.other_retired_ips = frozenset(other_retired_ips)
+
+    def remaining(self, now):
+        """Whole seconds until the deadline; floored at 0."""
+        return max(0, math.ceil(self.deadline - now))
+
+    def is_active(self, now):
+        return now < self.deadline
+
+    def deadline_text(self):
+        return datetime.fromtimestamp(self.deadline, timezone.utc).isoformat(timespec="seconds")
+
+    def to_dict(self, now):
+        return {
+            "ip": self.ip,
+            "deadline": self.deadline_text(),
+            "max_ttl": self.max_ttl,
+            "accepted_at": self.created_at,
+            "active": self.is_active(now),
+            "remaining_seconds": self.remaining(now),
+        }
+
+
+class View:
+    """Immutable combination of one published Snapshot and the committed
+    retirement state. A DNS query captures a single View and resolves its
+    whole chain against it, so a response never mixes zones and retirement
+    states from two submissions."""
+
+    __slots__ = ("snapshot", "retirements")
+
+    def __init__(self, snapshot, retirements):
+        self.snapshot = snapshot
+        self.retirements = tuple(retirements)
+
+    def active_for(self, now):
+        return [r for r in self.retirements if r.is_active(now)]
+
+    def to_dict(self, now):
+        return [r.to_dict(now) for r in self.retirements]
+
+
 class Snapshot:
     """Immutable view of one published version. A query resolves its whole
     alias chain against the single Snapshot instance captured at query start,
@@ -211,35 +340,53 @@ def snapshot_from_rows(version_id, created_at, rows):
     return Snapshot(version_id, created_at, records)
 
 
-class SnapshotHolder:
-    """Atomically-swapped reference to the current Snapshot.
+class ViewHolder:
+    """Atomically-swapped reference to the current committed View (zone
+    snapshot + retirement state).
 
-    Publishing swaps the reference only after the SQLite transaction has
-    committed; in-flight queries keep using the snapshot they captured, so
-    service never pauses and never mixes versions."""
+    Every publish and every retirement swaps the reference only after the
+    SQLite transaction has committed; in-flight queries keep using the view
+    they captured, so service never pauses and never mixes submissions."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._snap = None
+        self._view = None
 
     def get(self):
         with self._lock:
-            return self._snap
+            return self._view
 
-    def set(self, snap):
+    def set(self, view):
         with self._lock:
-            self._snap = snap
+            self._view = view
 
 
-def resolve(snapshot, qname, qtype):
-    """Resolve qname/qtype against one snapshot.
+def resolve(view, qname, qtype, now=None):
+    """Resolve qname/qtype against one committed View.
 
     Returns (rcode, answers) where answers is a list of
     (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME, ANY, ...
+
+    Retirement semantics, applied from the single view captured at query
+    start:
+      - addresses whose deadline has passed are removed from every A set;
+      - while a deadline is pending, the TTL of the whole A set at every
+        node (including A reached through a CNAME chain) is capped to the
+        smallest remaining whole seconds of the retirements touching it;
+      - CNAME TTLs are untouched.
     """
+    if now is None:
+        now = time.time()
     qname = qname.lower()
     if qname != ZONE and not qname.endswith("." + ZONE):
         return "REFUSED", []
+
+    snapshot = view.snapshot
+    active = view.active_for(now)
+    by_ip = {}
+    for r in active:
+        by_ip.setdefault(r.ip, []).append(r)
+    expired = {r.ip for r in view.retirements if not r.is_active(now)}
 
     answers = []
     node = qname
@@ -264,6 +411,12 @@ def resolve(snapshot, qname, qtype):
             continue
         if rec["A"]:
             if qtype in ("A", "ANY"):
-                answers.extend((node, "A", ip, rec["ttl"]) for ip in rec["A"])
+                ips = [ip for ip in rec["A"] if ip not in expired]
+                cap = min(
+                    (by_ip[ip][0].remaining(now) for ip in ips if ip in by_ip),
+                    default=None,
+                )
+                ttl = rec["ttl"] if cap is None else min(rec["ttl"], cap)
+                answers.extend((node, "A", ip, ttl) for ip in ips)
             return "NOERROR", answers
         return "NOERROR", answers  # pragma: no cover

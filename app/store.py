@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS retirements (
+    ip         TEXT PRIMARY KEY,
+    deadline   REAL NOT NULL,
+    max_ttl    INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -146,5 +152,68 @@ class Store:
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    # ----------------------------------------------------------- retirements
+    def max_published_a_ttl(self, ip):
+        """Largest TTL ever published for an A record of this IPv4.
+
+        Covers every version ever committed, including older versions whose
+        TTL has since been lowered ("刚调低 TTL 也要算上旧版").
+        Returns 0 when the address has never appeared in any A record.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(ttl) AS m FROM records WHERE rtype = 'A' AND value = ?",
+                (ip,),
+            ).fetchone()
+            return row["m"] if row and row["m"] is not None else 0
+        finally:
+            conn.close()
+
+    def get_retirement(self, ip):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT ip, deadline, max_ttl, created_at"
+                " FROM retirements WHERE ip = ?",
+                (ip,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_retirements(self):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT ip, deadline, max_ttl, created_at"
+                " FROM retirements ORDER BY deadline"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def insert_retirement(self, ip, deadline, max_ttl, created_at):
+        """Persist a new retirement. Fails (raising) if the row already
+        exists or any write error occurs; the caller leaves prior state
+        untouched. A repeated request re-reads the existing row instead."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO retirements (ip, deadline, max_ttl, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (ip, float(deadline), int(max_ttl), created_at),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()

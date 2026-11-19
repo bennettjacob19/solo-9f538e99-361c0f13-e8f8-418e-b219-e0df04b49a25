@@ -1,9 +1,10 @@
-"""UDP authoritative DNS server for svc.test., backed by the snapshot holder.
+"""UDP authoritative DNS server for svc.test., backed by the view holder.
 
-Each request captures the current Snapshot once and resolves its entire
-alias chain against it, so a response never mixes data from two versions.
-Publishing never blocks or interrupts serving: the swap is a reference
-assignment and old snapshots stay alive for in-flight queries."""
+Each request captures the current committed View once (zone snapshot plus
+retirement state) and resolves its entire alias chain against it, so a
+response never mixes data from two submissions. Publishing or retiring
+never blocks or interrupts serving: the swap is a reference assignment and
+old views stay alive for in-flight queries."""
 
 from dnslib import A, CNAME, QTYPE, RCODE, RR
 from dnslib.server import BaseResolver, DNSServer
@@ -12,8 +13,8 @@ from .zone import resolve
 
 
 class ZoneResolver(BaseResolver):
-    def __init__(self, get_snapshot):
-        self._get_snapshot = get_snapshot
+    def __init__(self, get_view):
+        self._get_view = get_view
 
     def resolve(self, request, handler):
         reply = request.reply()
@@ -23,12 +24,12 @@ class ZoneResolver(BaseResolver):
         except KeyError:
             qtype = "UNKNOWN"
 
-        snapshot = self._get_snapshot()  # captured once: single version per answer
-        if snapshot is None:
+        view = self._get_view()  # captured once: one committed state per answer
+        if view is None or view.snapshot is None:
             reply.header.rcode = RCODE.SERVFAIL  # nothing published yet
             return reply
 
-        rcode, answers = resolve(snapshot, qname, qtype)
+        rcode, answers = resolve(view, qname, qtype)
         reply.header.rcode = getattr(RCODE, rcode)
         if rcode in ("NOERROR", "NXDOMAIN"):
             reply.header.aa = 1
@@ -40,7 +41,7 @@ class ZoneResolver(BaseResolver):
         return reply
 
 
-def start_dns_server(get_snapshot, host, port):
-    server = DNSServer(ZoneResolver(get_snapshot), port=port, address=host, tcp=False)
+def start_dns_server(get_view, host, port):
+    server = DNSServer(ZoneResolver(get_view), port=port, address=host, tcp=False)
     server.start_thread()  # dnslib marks the thread as daemon
     return server
